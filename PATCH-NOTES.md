@@ -67,10 +67,9 @@ Run:
 
     ./mvnw test -Dtest=BuildV2ProxyEventCookiesTest
 
-The API Gateway packages (`-Dtest=**/services/apigateway/**,**/services/apigatewayv2/**`), run in a
-build container with no Docker socket: 1223 tests unpatched, 1230 patched (the 7 new), with 41
-failures and 41 errors in both. The 82 failing tests are identical in both runs; all are tests that
-start Lambda containers (WebSocket, Lambda authorizer and binary-payload integration tests).
+The API Gateway and API Gateway v2 test classes plus `LambdaUrl*` and `CookieHeadersTest`, run in a
+JDK 25 build container with the Docker socket mounted, so the tests start real Lambda containers:
+1315 tests unpatched, 1322 patched (the 7 new), with no failures, errors or skips in either.
 
 ## Image
 
