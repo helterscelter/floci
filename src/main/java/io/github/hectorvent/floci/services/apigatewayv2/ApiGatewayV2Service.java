@@ -611,30 +611,78 @@ public class ApiGatewayV2Service {
     }
 
     /**
-     * Finds the best matching route for the given HTTP method and path.
-     * Priority: exact match > path-template match > $default.
+     * Finds the most specific route matching the given HTTP method and path, whatever order the
+     * routes were created in. AWS ("Working with routes for HTTP APIs", "Routing API requests")
+     * selects "the route with the most-specific match": a full match for a route and method, then
+     * a match on a route with a greedy path variable, then {@code $default}; and {@code ANY}
+     * "matches all methods that you haven't defined for a route". Among the matching routes:
+     * <ol>
+     *   <li>a route without a greedy variable beats one with a greedy variable;</li>
+     *   <li>then, segment by segment from the left, a literal segment beats a path variable,
+     *       which beats a greedy variable, so the longer literal prefix wins;</li>
+     *   <li>then a route naming the request's method beats {@code ANY} on the same path.</li>
+     * </ol>
+     * {@code $default} is chosen only when no other route matches.
      */
     public Route findMatchingRoute(String region, String apiId, String httpMethod, String path) {
         List<Route> routes = getRoutes(region, apiId);
-        String candidate = httpMethod.toUpperCase() + " " + path;
 
-        // 1. Exact match
+        Route best = null;
+        int[] bestRank = null;
+        Route defaultRoute = null;
         for (Route r : routes) {
-            if (candidate.equals(r.getRouteKey())) return r;
+            String key = r.getRouteKey();
+            if (key == null) continue;
+            if ("$default".equals(key)) {
+                if (defaultRoute == null) defaultRoute = r;
+                continue;
+            }
+            if (!routeKeyMatchesPath(key, httpMethod, path)) continue;
+            int[] rank = routeSpecificity(key);
+            if (bestRank == null || java.util.Arrays.compare(rank, bestRank) < 0) {
+                best = r;
+                bestRank = rank;
+            }
         }
+        return best != null ? best : defaultRoute;
+    }
 
-        // 2. Path-template match (e.g. "GET /users/{id}")
-        for (Route r : routes) {
-            if (r.getRouteKey() == null || r.getRouteKey().equals("$default")) continue;
-            if (routeKeyMatchesPath(r.getRouteKey(), httpMethod, path)) return r;
+    private static final int SEGMENT_LITERAL = 0;
+    private static final int SEGMENT_VARIABLE = 1;
+    private static final int SEGMENT_GREEDY = 2;
+
+    /**
+     * The sort key of a matching route key ("METHOD /path"); lower is more specific. Element 0 is
+     * 1 when the path ends in a greedy variable; then one element per path segment
+     * ({@link #SEGMENT_LITERAL}, {@link #SEGMENT_VARIABLE}, {@link #SEGMENT_GREEDY}); the last
+     * element is 1 for {@code ANY}. Two greedy routes that both match a path share their segments
+     * up to the shorter one's greedy segment, where the longer one has a literal or a variable, so
+     * the comparison is decided there before the method element is reached; two routes on the same
+     * path differ only in that last element.
+     */
+    private static int[] routeSpecificity(String routeKey) {
+        int space = routeKey.indexOf(' ');
+        String method = routeKey.substring(0, space);
+        String pattern = routeKey.substring(space + 1);
+        String[] segments = pattern.split("/", -1);
+        int[] rank = new int[segments.length + 2];
+        boolean greedy = false;
+        for (int i = 0; i < segments.length; i++) {
+            String s = segments[i];
+            int kind;
+            if (s.startsWith("{") && s.endsWith("+}")) {
+                kind = SEGMENT_GREEDY;
+                greedy = true;
+            } else if (s.contains("{")) {
+                kind = SEGMENT_VARIABLE;
+            } else {
+                kind = SEGMENT_LITERAL;
+            }
+            rank[i + 1] = kind;
         }
-
-        // 3. $default catch-all
-        for (Route r : routes) {
-            if ("$default".equals(r.getRouteKey())) return r;
-        }
-
-        return null;
+        rank[0] = greedy ? 1 : 0;
+        rank[segments.length + 1] = "ANY".equalsIgnoreCase(method) ? 1 : 0;
+        return rank;
     }
 
     /**
