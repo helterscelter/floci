@@ -2627,9 +2627,9 @@ public class ApiGatewayExecuteController {
      * Builds a REQUEST authorizer event in payload format version 2.0.
      * Uses the newer HTTP API-native shape with routeArn, routeKey, rawPath, and requestContext.http.
      */
-    private String buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
-                                                  String apiId, String stageName, String region,
-                                                  HttpHeaders headers, UriInfo uriInfo) {
+    String buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
+                                         String apiId, String stageName, String region,
+                                         HttpHeaders headers, UriInfo uriInfo) {
         // rawPath is by contract the raw, unmodified path, so recover the trailing slash the
         // JAX-RS {proxy} binding stripped. routeArn keeps the normalized path for the same reason
         // methodArn does in the 1.0 shape above.
@@ -2644,10 +2644,14 @@ public class ApiGatewayExecuteController {
         event.put("rawQueryString", uriInfo.getRequestUri().getRawQuery() != null
                 ? uriInfo.getRequestUri().getRawQuery() : "");
 
-        // Headers (lowercase keys for v2)
-        ObjectNode headersNode = event.putObject("headers");
+        // Headers (lowercase keys for v2), the request's cookies in their own array
         MultivaluedMap<String, String> reqHeaders = headers.getRequestHeaders();
+        putV2Cookies(event, reqHeaders);
+        ObjectNode headersNode = event.putObject("headers");
         for (Map.Entry<String, List<String>> e : reqHeaders.entrySet()) {
+            if (isCookieHeader(e.getKey())) {
+                continue;
+            }
             if (!e.getValue().isEmpty()) headersNode.put(e.getKey().toLowerCase(), e.getValue().get(0));
         }
 
@@ -2814,6 +2818,38 @@ public class ApiGatewayExecuteController {
         };
     }
 
+    /**
+     * Payload format 2.0 lists every cookie-pair of every {@code Cookie} request header, in
+     * request order, in a {@code cookies} array, and leaves the field out when the request has
+     * none. The {@code cookie} header itself is not repeated in {@code headers}. See "Payload
+     * format differences" in
+     * https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html.
+     */
+    private static void putV2Cookies(ObjectNode event, MultivaluedMap<String, String> requestHeaders) {
+        List<String> cookies = new ArrayList<>();
+        for (Map.Entry<String, List<String>> e : requestHeaders.entrySet()) {
+            if (!isCookieHeader(e.getKey())) {
+                continue;
+            }
+            for (String header : e.getValue()) {
+                for (String cookie : header.split(";")) {
+                    String trimmed = cookie.trim();
+                    if (!trimmed.isEmpty()) {
+                        cookies.add(trimmed);
+                    }
+                }
+            }
+        }
+        if (!cookies.isEmpty()) {
+            ArrayNode cookiesNode = event.putArray("cookies");
+            cookies.forEach(cookiesNode::add);
+        }
+    }
+
+    private static boolean isCookieHeader(String name) {
+        return HttpHeaders.COOKIE.equalsIgnoreCase(name);
+    }
+
     String buildV2ProxyEvent(String httpMethod, String path, String routeKey,
                                      String apiId, String region, String stageName,
                                      HttpHeaders headers, UriInfo uriInfo,
@@ -2872,8 +2908,12 @@ public class ApiGatewayExecuteController {
         event.put("rawQueryString", uriInfo.getRequestUri().getRawQuery() != null
                 ? uriInfo.getRequestUri().getRawQuery() : "");
 
+        putV2Cookies(event, headers.getRequestHeaders());
         ObjectNode headersNode = event.putObject("headers");
         for (Map.Entry<String, java.util.List<String>> e : headers.getRequestHeaders().entrySet()) {
+            if (isCookieHeader(e.getKey())) {
+                continue;
+            }
             if (!e.getValue().isEmpty()) headersNode.put(e.getKey().toLowerCase(), e.getValue().get(0));
         }
 
