@@ -1,6 +1,6 @@
 # Patch notes: Floci 2.1.0 patched for Cramageddon
 
-This branch is Floci `2.1.0` plus two fixes, each cherry-picked from its own branch, where its patch
+This branch is Floci `2.1.0` plus three fixes, each cherry-picked from its own branch, where its patch
 notes give the AWS reference, the tests and the upstream status in full. It is the branch the
 Cramageddon image is built from; it is not for upstream.
 
@@ -8,6 +8,7 @@ Cramageddon image is built from; it is not for upstream.
 |---|---|---|
 | HTTP API payload format 2.0: the request's cookies in the event's `cookies` array, and no `cookie` entry in `headers` | `fix/http-api-payload-2-cookies` | the `cookies` array is upstream #5152, in no release as of 2026-10-13; the omission of the `cookie` header is not upstream |
 | HTTP API route selection: the most specific matching route, not the first in store order | `fix/http-api-route-priority` | not upstream as of 2026-10-13 |
+| The request body on `DELETE`: passed to the integration, as on the other methods | `fix/http-api-delete-body` | not upstream as of 2026-10-14 |
 
 ## Payload 2.0 cookies
 
@@ -30,13 +31,25 @@ all methods that you haven't defined for a route."
 (https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-routes.html, "Routing
 API requests"). Tests: `HttpApiRoutePriorityTest`, 21 cases.
 
+## DELETE body
+
+The `DELETE` handlers of `ApiGatewayExecuteController` (`/execute-api`), `ApiGatewayAwsExecuteController`
+(`/_aws/execute-api`) and `ApiGatewayUserRequestController` (`/restapis/.../_user_request_`) take the
+request body and pass it to `dispatch`, as the `POST`, `PUT` and `PATCH` handlers do; each passed `null`,
+so a payload 2.0 Lambda event carried `"body": null` for a `DELETE` that sent a body. A `DELETE` without
+a body still carries `"body": null`. AWS: the payload format 2.0 event has a `body` field, and the page
+names no method whose body is left out
+(https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html).
+An HTTP_PROXY integration's `DELETE` is still sent without a body (`HttpProxyInvoker`); that is not
+changed. Tests: `HttpApiDeleteBodyIntegrationTest`, 6 cases, which start a real Lambda container.
+
 ## Tests
 
-    ./mvnw test -Dtest=BuildV2ProxyEventCookiesTest,HttpApiRoutePriorityTest
+    ./mvnw test -Dtest=BuildV2ProxyEventCookiesTest,HttpApiRoutePriorityTest,HttpApiDeleteBodyIntegrationTest
 
 The API Gateway packages (`-Dtest=**/services/apigateway/**,**/services/apigatewayv2/**`) run in a
-JDK 25 build container with the Docker socket mounted: 1251 tests (1223 at `2.1.0`, the 7 cookies
-cases and the 21 route cases), with no failures, errors or skips.
+JDK 25 build container with the Docker socket mounted: 1257 tests (1223 at `2.1.0`, the 7 cookies
+cases, the 21 route cases and the 6 DELETE body cases), with no failures, errors or skips.
 
 ## Image
 
@@ -47,5 +60,6 @@ which the exported tree lacks).
 
 ## Retirement
 
-The branch is retired when an upstream release carries both: the request `cookies` array without the
-`cookie` header in `headers`, and most-specific HTTP API route selection.
+The branch is retired when an upstream release carries all three: the request `cookies` array without
+the `cookie` header in `headers`, most-specific HTTP API route selection, and the request body passed
+through on `DELETE`.
