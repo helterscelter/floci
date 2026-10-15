@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -44,8 +45,10 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -112,6 +115,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
+    // Stamped as LAMBDA_RUN_LABEL on every container this process creates, so a sweep can tell its own apart.
+    private final String runId = UUID.randomUUID().toString();
+    private final Object leftoverSweepLock = new Object();
+    private volatile boolean leftoversSwept;
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -139,6 +146,93 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.populateSemaphore = new java.util.concurrent.Semaphore(resolvePopulateConcurrency(config));
     }
 
+    /**
+     * Removes the Lambda containers a previous run of this Floci left on the daemon. A container
+     * whose Floci was removed or killed without a graceful stop (a {@code docker rm -f}, a compose
+     * recreate, SIGKILL, OOM) is never adopted: its runtime polls a Runtime API port that died
+     * with that process, and the warm pool that tracked it died too. Only containers this
+     * deployment owns qualify: the Lambda service label, this deployment's
+     * {@link ContainerStorageHelper#OWNER_LABEL} (API port, behind the resource namespace) and this
+     * instance's container name prefix, so another Floci sharing the daemon, with its own port,
+     * namespace or prefix, is left alone, as is anything without the owner label (containers from
+     * before it was stamped). A container of the current run, whether warm or still starting, is
+     * left alone: the run label decides that rather than the creation time.
+     *
+     * @return whether every leftover is gone: false when Docker could not list or remove one
+     */
+    boolean removeLeftoverContainers(String currentRunId) {
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        String namePrefix = ContainerStorageHelper.prefixedDockerName(config,
+                resolveContainerNamePrefix(config), "");
+        ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
+        List<Container> containers;
+        try {
+            containers = aliases.listByLabels(
+                    Map.of(ContainerStorageHelper.SERVICE_LABEL, "lambda",
+                            ContainerStorageHelper.OWNER_LABEL, owner),
+                    filter -> lifecycleManager.getDockerClient().listContainersCmd()
+                            .withShowAll(true)
+                            .withLabelFilter(filter)
+                            .exec(),
+                    Container::getId);
+        } catch (Exception e) {
+            LOG.warnv("Could not list the Lambda containers a previous run left behind: {0}", e.getMessage());
+            return false;
+        }
+        boolean allRemoved = true;
+        int removed = 0;
+        for (Container container : containers) {
+            Map<String, String> labels = container.getLabels() == null ? Map.of() : container.getLabels();
+            if (!aliases.consistent(container.getId(), labels)
+                    || !"lambda".equals(labels.get(ContainerStorageHelper.SERVICE_LABEL))
+                    || !aliases.matches(labels, ContainerStorageHelper.OWNER_LABEL, owner)
+                    || currentRunId.equals(labels.get(ContainerStorageHelper.LAMBDA_RUN_LABEL))
+                    || !hasNamePrefix(container, namePrefix)) {
+                continue;
+            }
+            try {
+                lifecycleManager.removeIfExistsStrict(container.getId());
+                removed++;
+            } catch (Exception e) {
+                allRemoved = false;
+                LOG.warnv("Could not remove Lambda container {0} left by a previous run: {1}",
+                        container.getId(), e.getMessage());
+            }
+        }
+        if (removed > 0) {
+            LOG.infov("Removed {0} Lambda container(s) left by a previous run", removed);
+        }
+        return allRemoved;
+    }
+
+    private static boolean hasNamePrefix(Container container, String namePrefix) {
+        if (container.getNames() == null) {
+            return false;
+        }
+        for (String name : container.getNames()) {
+            if (name != null && name.startsWith("/" + namePrefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Runs {@link #removeLeftoverContainers} before the first launch, and again before each later
+     * launch until one sweep has removed everything it found. A launch proceeds after a failed
+     * sweep: the leftovers belong to another run, so they cannot collide with the new container.
+     */
+    void sweepLeftoversOnce() {
+        if (leftoversSwept || !config.services().lambda().reconcileContainersOnStartup()) {
+            return;
+        }
+        synchronized (leftoverSweepLock) {
+            if (!leftoversSwept) {
+                leftoversSwept = removeLeftoverContainers(runId);
+            }
+        }
+    }
+
     @PostConstruct
     void init() {
         volumeCleanupScheduler.scheduleAtFixedRate(this::cleanupSupersededVolumes,
@@ -152,6 +246,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     public ContainerHandle launch(LambdaFunction fn) {
         LOG.infov("Launching container for function: {0}", fn.getFunctionName());
+        sweepLeftoversOnce();
 
         // For Zip functions, verify code exists before allocating any resources.
         // Hot-reload functions use a bind-mount; the Docker daemon validates the path at start.
@@ -275,6 +370,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
         applyDockerFlags(specBuilder, dockerFlags);
+        // After the user's flags, so a --label cannot take the sweep's identity away from the container.
+        specBuilder.withLabels(Map.of(
+                ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config),
+                ContainerStorageHelper.LAMBDA_RUN_LABEL, runId));
 
         specBuilder.withEmbeddedDns();
 
