@@ -394,6 +394,7 @@ floci:
       code-path: ./data/lambda-code
       zip-max-entries: 100000
       poll-interval-ms: 1000
+      sqs-default-max-concurrency: 10         # FLOCI_SERVICES_LAMBDA_SQS_DEFAULT_MAX_CONCURRENCY - concurrent batches per SQS event-source mapping without ScalingConfig.MaximumConcurrency
       async-retry-delay-seconds: 60           # FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_DELAY_SECONDS - a failed Event invocation waits this before its first retry and twice this before its second (AWS: 1 min, then 2); 0 retries back to back
       container-idle-timeout-seconds: 300
       # warm-pool-max-per-function:           # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION - idle containers kept per function (default max(4, cpus))

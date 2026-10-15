@@ -2841,6 +2841,11 @@ public interface EmulatorConfig {
         @WithDefault("1000")
         long pollIntervalMs();
 
+        // Concurrent polls per SQS event-source mapping when the mapping sets no
+        // ScalingConfig.MaximumConcurrency. AWS scales standard queues up to 1,250 concurrent invocations.
+        @WithDefault("10")
+        int sqsDefaultMaxConcurrency();
+
         /**
          * Seconds before the first retry of a failed asynchronous invocation. Retry n waits n times
          * this, so the default of 60 matches AWS: one minute, then two. Zero retries back to back.
