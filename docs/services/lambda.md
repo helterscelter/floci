@@ -482,6 +482,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API range. One port is held per running container, so the range width caps concurrent executions. Each running container also holds two Docker connections, so a wider range needs a matching `FLOCI_DOCKER_MAX_CONNECTIONS` |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Directory where Lambda ZIP files are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | Event-source mapping poll interval (milliseconds) |
+| `FLOCI_SERVICES_LAMBDA_SQS_DEFAULT_MAX_CONCURRENCY` | `10` | Concurrent batches per SQS event-source mapping that sets no `ScalingConfig.MaximumConcurrency` |
 | `FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_DELAY_SECONDS` | `60` | Wait before the first retry of a failed asynchronous invocation (seconds); the second waits twice this, `0` retries back to back |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Idle container shutdown timeout (seconds) |
 | `FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION` | `max(4, cpus)` | Maximum idle (warm) containers kept per function |
@@ -1078,12 +1079,15 @@ Validation mirrors AWS: values outside 2–1000 are rejected with
 source (Kinesis / DynamoDB Streams) is also rejected. Those services
 use `ParallelizationFactor` instead, which is a separate field.
 
-!!! note "Enforcement status"
-    The configured `MaximumConcurrency` is persisted and returned on the
-    wire, but the SQS poller does not yet cap concurrent invocations at
-    this value (the poller today serializes invocations per ESM to one
-    at a time regardless). Real parallel dispatch capped by
-    `MaximumConcurrency` is tracked as a follow-up.
+While a batch is being processed the mapping keeps polling, so batches run
+in parallel, up to `MaximumConcurrency` at once. A mapping with no
+`ScalingConfig` runs up to `FLOCI_SERVICES_LAMBDA_SQS_DEFAULT_MAX_CONCURRENCY`
+(default `10`) batches at once. AWS scales a standard queue's mapping up to
+1,250 concurrent invocations; Floci's default is lower to bound local load.
+On a FIFO queue a message group with a message in flight is not received
+again until that message is deleted or becomes visible, so each group is
+processed in order, one batch at a time, while different groups run in
+parallel.
 
 ### FilterCriteria
 

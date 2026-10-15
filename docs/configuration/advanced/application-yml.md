@@ -166,6 +166,7 @@ floci:
       code-path: ./data/lambda-code           # Where ZIP archives are stored
       zip-max-entries: 100000                  # Maximum ZIP entries extracted per deployment package
       poll-interval-ms: 1000
+      sqs-default-max-concurrency: 10         # Concurrent batches per SQS event source mapping without ScalingConfig.MaximumConcurrency
       async-retry-delay-seconds: 60           # Wait before the first retry of a failed Event invocation; the second waits twice this
       container-idle-timeout-seconds: 300     # Remove idle containers after this
       # warm-pool-max-per-function:           # Idle containers kept per function (default max(4, cpus))

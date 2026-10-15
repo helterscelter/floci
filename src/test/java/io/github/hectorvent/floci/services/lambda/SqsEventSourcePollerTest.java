@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.ScalingConfig;
 import io.github.hectorvent.floci.services.pipes.PipesFilterMatcher;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
@@ -19,13 +20,16 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -35,6 +39,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -42,6 +47,7 @@ import static org.mockito.Mockito.when;
 class SqsEventSourcePollerTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final int DEFAULT_MAX_CONCURRENCY = 3;
     private SqsEventSourcePoller poller;
     private SqsService sqsService;
     private LambdaExecutorService executorService;
@@ -56,6 +62,7 @@ class SqsEventSourcePollerTest {
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambdaConfig);
         when(lambdaConfig.pollIntervalMs()).thenReturn(1000L);
+        when(lambdaConfig.sqsDefaultMaxConcurrency()).thenReturn(DEFAULT_MAX_CONCURRENCY);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
 
         sqsService = mock(SqsService.class);
@@ -462,7 +469,7 @@ class SqsEventSourcePollerTest {
         esm.setBatchSize(batchSize);
         if (patterns.length > 0) {
             EventSourceMapping.FilterCriteria fc = new EventSourceMapping.FilterCriteria();
-            List<EventSourceMapping.Filter> filters = new java.util.ArrayList<>();
+            List<EventSourceMapping.Filter> filters = new ArrayList<>();
             for (String p : patterns) {
                 EventSourceMapping.Filter f = new EventSourceMapping.Filter();
                 f.setPattern(p);
@@ -499,11 +506,13 @@ class SqsEventSourcePollerTest {
 
     /**
      * Hard happens-after barrier: re-stub the fetch to return empty, then re-kick until a SECOND
-     * receiveMessage is observed. {@code activePolls} serializes polls per ESM, so fetch #2 cannot begin until
+     * receiveMessage is observed. a cap of one serializes polls per ESM, so fetch #2 cannot begin until
      * poll #1's finally-block ran, so poll #1 is fully complete. The empty re-stub makes poll #2 a no-op, so
-     * poll #1's exact delete/return counts are preserved for the assertions.
+     * poll #1's exact delete/return counts are preserved for the assertions. The ESM is capped at one
+     * concurrent poll first, so poll #2 is skipped while poll #1 is still running.
      */
     private void awaitPollCompleted(EventSourceMapping esm) {
+        esm.setScalingConfig(new ScalingConfig(1));
         when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
                 .thenReturn(List.of());
         long deadline = System.currentTimeMillis() + 5000;
@@ -850,5 +859,146 @@ class SqsEventSourcePollerTest {
         awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         verify(sqsService, never()).changeMessageVisibility(eq(esm.getQueueUrl()), eq("rh-m1"), anyInt(), any());
+    }
+
+    /** Stubs receive to hand out one fresh message per call, so overlapping polls get distinct messages. */
+    private void stubReceiveDistinctMessages(EventSourceMapping esm) {
+        AtomicInteger next = new AtomicInteger();
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenAnswer(inv -> List.of(message("m" + next.incrementAndGet())));
+    }
+
+    /**
+     * Makes every invocation block until released, recording how many run at once. Returns the latch
+     * that releases them and the peak counter.
+     */
+    private CountDownLatch stubBlockingInvoke(LambdaFunction fn, AtomicInteger running, AtomicInteger peak) {
+        CountDownLatch release = new CountDownLatch(1);
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenAnswer(inv -> {
+                    peak.accumulateAndGet(running.incrementAndGet(), Math::max);
+                    try {
+                        release.await(10, TimeUnit.SECONDS);
+                    } finally {
+                        running.decrementAndGet();
+                    }
+                    return new InvokeResult();
+                });
+        return release;
+    }
+
+    @Test
+    void secondBatchIsInvokedWhileTheFirstIsStillInFlight() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setBatchSize(10); // one message per receive is an underfilled batch, so polls do not chain
+        stubReceiveDistinctMessages(esm);
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        CountDownLatch release = stubBlockingInvoke(fn, running, peak);
+
+        Future<?> first = poller.pollAndInvoke(esm);
+        Future<?> second = poller.pollAndInvoke(esm);
+
+        // Both batches are in the function at the same time; the second did not wait for the first.
+        verify(executorService, timeout(2000).times(2))
+                .invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        assertEquals(2, peak.get());
+
+        release.countDown();
+        awaitPoll(first);
+        awaitPoll(second);
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
+    }
+
+    @Test
+    void scalingConfigMaximumConcurrencyBoundsBatchesInFlight() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setBatchSize(10); // one message per receive is an underfilled batch, so polls do not chain
+        esm.setScalingConfig(new ScalingConfig(2));
+        stubReceiveDistinctMessages(esm);
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        CountDownLatch release = stubBlockingInvoke(fn, running, peak);
+
+        List<Future<?>> polls = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            polls.add(poller.pollAndInvoke(esm));
+        }
+
+        verify(executorService, timeout(2000).times(2))
+                .invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        // The three polls over the cap were skipped, not queued.
+        sleep(200);
+        verify(executorService, times(2)).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        assertEquals(2, peak.get());
+
+        release.countDown();
+        polls.forEach(SqsEventSourcePollerTest::awaitPoll);
+        assertEquals(2, peak.get());
+    }
+
+    @Test
+    void mappingWithoutScalingConfigIsBoundedByTheConfiguredDefault() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setBatchSize(10); // one message per receive is an underfilled batch, so polls do not chain
+        stubReceiveDistinctMessages(esm);
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        CountDownLatch release = stubBlockingInvoke(fn, running, peak);
+
+        List<Future<?>> polls = new ArrayList<>();
+        for (int i = 0; i < DEFAULT_MAX_CONCURRENCY + 2; i++) {
+            polls.add(poller.pollAndInvoke(esm));
+        }
+
+        verify(executorService, timeout(2000).times(DEFAULT_MAX_CONCURRENCY))
+                .invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        sleep(200);
+        assertEquals(DEFAULT_MAX_CONCURRENCY, peak.get());
+
+        release.countDown();
+        polls.forEach(SqsEventSourcePollerTest::awaitPoll);
+    }
+
+    @Test
+    void aFreedSlotIsUsedByTheNextPoll() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setBatchSize(10); // one message per receive is an underfilled batch, so polls do not chain
+        esm.setScalingConfig(new ScalingConfig(2));
+        stubReceiveDistinctMessages(esm);
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+
+        for (int i = 0; i < 4; i++) {
+            awaitPoll(poller.pollAndInvoke(esm));
+        }
+
+        verify(executorService, times(4)).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void aTickThatReceivesAFullBatchFillsTheFreeSlots() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setBatchSize(1);
+        stubReceiveDistinctMessages(esm);
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        CountDownLatch release = stubBlockingInvoke(fn, running, peak);
+
+        Future<?> poll = poller.pollAndInvoke(esm, true);
+
+        // One tick, yet the backlog fills every free slot: each full batch chains the next poll.
+        verify(executorService, timeout(2000).times(DEFAULT_MAX_CONCURRENCY))
+                .invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        assertEquals(DEFAULT_MAX_CONCURRENCY, peak.get());
+
+        release.countDown();
+        awaitPoll(poll);
     }
 }

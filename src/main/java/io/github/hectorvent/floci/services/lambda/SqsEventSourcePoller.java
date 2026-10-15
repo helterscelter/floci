@@ -32,6 +32,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
@@ -55,14 +56,19 @@ public class SqsEventSourcePoller implements Resettable {
     private final LambdaTargetResolver targetResolver;
     private final EsmStore esmStore;
     private final long pollIntervalMs;
+    private final int defaultMaxConcurrency;
     private final String baseUrl;
     private final ObjectMapper objectMapper;
     private final PipesFilterMatcher filterMatcher;
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
-    // Tracks ESMs with an in-flight poll to prevent concurrent deliveries of the same message
-    private final ConcurrentHashMap<String, Boolean> activePolls = new ConcurrentHashMap<>();
+    // Polls in flight per ESM (receive through delete), bounded by the ESM's effective concurrency.
+    // Concurrent polls never deliver the same message twice: SQS hides a received message, and on a
+    // FIFO queue a message group with an in-flight message is not received again until it is deleted.
+    private final ConcurrentHashMap<String, AtomicInteger> inFlightPolls = new ConcurrentHashMap<>();
+    // Serialises the receive step per ESM, so the batching-window buffer below has one writer at a time.
+    private final ConcurrentHashMap<String, Object> receiveLocks = new ConcurrentHashMap<>();
     // Underfilled batches held open by MaximumBatchingWindowInSeconds, keyed by ESM uuid. Only ever
-    // mutated inside the activePolls-guarded section, so one thread touches a given entry at a time.
+    // mutated inside the receiveLocks-guarded section, so one thread touches a given entry at a time.
     private final ConcurrentHashMap<String, PendingBatch> pendingBatches = new ConcurrentHashMap<>();
     // Wall clock for the batching-window deadline; overridable so tests can advance it without sleeping.
     private volatile LongSupplier clockMs = System::currentTimeMillis;
@@ -85,6 +91,7 @@ public class SqsEventSourcePoller implements Resettable {
         this.targetResolver = targetResolver;
         this.esmStore = esmStore;
         this.pollIntervalMs = config.services().lambda().pollIntervalMs();
+        this.defaultMaxConcurrency = Math.max(1, config.services().lambda().sqsDefaultMaxConcurrency());
         this.baseUrl = config.effectiveBaseUrl();
         this.objectMapper = objectMapper;
         this.filterMatcher = filterMatcher;
@@ -111,7 +118,8 @@ public class SqsEventSourcePoller implements Resettable {
     public void clear() {
         timerIds.values().forEach(vertx::cancelTimer);
         timerIds.clear();
-        activePolls.clear();
+        inFlightPolls.clear();
+        receiveLocks.clear();
         pendingBatches.clear();
     }
 
@@ -137,7 +145,7 @@ public class SqsEventSourcePoller implements Resettable {
             // Use account-scoped lookup since this runs outside request scope.
             esmStore.getForAccount(accountId, uuid).ifPresent(latest -> {
                 if (latest.isEnabled()) {
-                    pollAndInvoke(latest);
+                    pollAndInvoke(latest, true);
                 }
             });
         });
@@ -158,163 +166,214 @@ public class SqsEventSourcePoller implements Resettable {
     /**
      * Package-private (not private) only so unit tests can drive a single poll directly and wait
      * for it to finish through the returned future.
+     *
+     * <p>A mapping runs up to its effective concurrency of polls at once, so a batch in flight does
+     * not hold up the next one. The effective concurrency is the ESM's
+     * {@code ScalingConfig.MaximumConcurrency} when set, else {@code floci.services.lambda.sqs-default-max-concurrency}.
+     * A tick that finds every slot taken is skipped.
      */
     Future<?> pollAndInvoke(EventSourceMapping esm) {
-        // Skip this tick if a previous poll for this ESM is still in progress.
-        // This prevents concurrent deliveries of the same message when the Lambda
-        // cold-start / execution time exceeds the SQS visibility timeout.
-        if (activePolls.putIfAbsent(esm.getUuid(), Boolean.TRUE) != null) {
+        return pollAndInvoke(esm, false);
+    }
+
+    /**
+     * @param drainBacklog when true, a poll that receives a full batch starts another poll at once
+     *                     (if a slot is free), so a backlog fills the free slots within one tick
+     */
+    Future<?> pollAndInvoke(EventSourceMapping esm, boolean drainBacklog) {
+        AtomicInteger inFlight = inFlightPolls.computeIfAbsent(esm.getUuid(), k -> new AtomicInteger());
+        if (!tryAcquirePollSlot(inFlight, effectiveMaxConcurrency(esm))) {
             return CompletableFuture.completedFuture(null);
         }
         return pollExecutor.submit(() -> {
             try {
-                // Look up the function first so we can set an appropriate visibility
-                // timeout: fn.timeout + 30s keeps messages hidden while Lambda runs.
-                // Use account-scoped lookup since this runs outside request scope.
-                LambdaFunction fn = targetResolver.resolveMappingTarget(esm).orElse(null);
-                if (fn == null) {
-                    LOG.warnv("ESM {0}: function {1} not found in region {2}, skipping",
-                            esm.getUuid(), esm.getFunctionName(), esm.getRegion());
-                    return;
-                }
-
-                // MaximumBatchingWindowInSeconds holds an underfilled batch open: keep messages
-                // received across earlier polls invisible and only invoke once the batch fills or
-                // the window since the first buffered message expires.
-                int window = esm.getMaximumBatchingWindowInSeconds() == null
-                        ? 0 : esm.getMaximumBatchingWindowInSeconds();
-                // A message can be buffered for the whole window and then processed for the full
-                // function timeout, so visibility has to cover both plus AWS's 30s margin, not the
-                // larger of the two. Otherwise a long invoke can outlive the visibility and another
-                // consumer receives the message, causing a duplicate delivery and a stale handle.
-                int visibilityTimeout = fn.getTimeout() + Math.max(window, 0) + 30;
-
-                PendingBatch pending = pendingBatches.get(esm.getUuid());
-                int alreadyBuffered = pending != null ? pending.messages.size() : 0;
-                int wanted = Math.max(1, esm.getBatchSize() - alreadyBuffered);
-
-                List<Message> received = sqsService.receiveMessage(
-                        esm.getQueueUrl(), wanted, visibilityTimeout, 0, esm.getRegion());
-
-                List<Message> messages;
-                if (window <= 0) {
-                    // No window, or one that was just turned off: deliver now, draining anything a
-                    // previous positive window had buffered so those messages are not stranded
-                    // until their visibility expires (and cannot be replayed if the window returns).
-                    List<Message> batch = pending != null ? pending.messages : new ArrayList<>();
-                    pendingBatches.remove(esm.getUuid());
-                    batch.addAll(received);
-                    if (batch.isEmpty()) {
-                        return;
-                    }
-                    messages = batch;
-                } else {
-                    if (pending == null) {
-                        pending = new PendingBatch();
-                        pendingBatches.put(esm.getUuid(), pending);
-                    }
-                    if (pending.messages.isEmpty() && !received.isEmpty()) {
-                        pending.windowStartedAtMs = clockMs.getAsLong();
-                    }
-                    pending.messages.addAll(received);
-                    if (pending.messages.isEmpty()) {
-                        return;
-                    }
-                    boolean batchFull = pending.messages.size() >= esm.getBatchSize();
-                    boolean windowElapsed =
-                            clockMs.getAsLong() - pending.windowStartedAtMs >= window * 1000L;
-                    if (!batchFull && !windowElapsed) {
-                        return;
-                    }
-                    messages = new ArrayList<>(pending.messages);
-                    pendingBatches.remove(esm.getUuid());
-                }
-
-                LOG.infov("ESM {0}: received {1} message(s)", esm.getUuid(), messages.size());
-
-                // Apply FilterCriteria. AWS consumes (permanently deletes) filtered-out SQS messages, so
-                // non-matching messages are deleted immediately: leaving them would redeliver every
-                // visibility window forever and never reach the DLQ. A batch that matches nothing
-                // short-circuits without invoking.
-                List<Message> matched = messages;
-                JsonNode filterParams = EsmFilterCriteriaUtils.matcherSourceParameters(objectMapper, esm.getFilterCriteria());
-                if (filterParams != null) {
-                    List<JsonNode> recordNodes = new ArrayList<>(messages.size());
-                    for (Message m : messages) {
-                        recordNodes.add(buildSqsRecordNode(m, esm));
-                    }
-                    matched = EsmFilterCriteriaUtils.selectMatched(
-                            messages, recordNodes, filterMatcher.applyFilterCriteria(recordNodes, filterParams));
-                    Set<Message> keep = Collections.newSetFromMap(new IdentityHashMap<>());
-                    keep.addAll(matched);
-                    for (Message m : messages) {
-                        if (!keep.contains(m)) {
-                            try {
-                                sqsService.deleteMessage(esm.getQueueUrl(), m.getReceiptHandle(), esm.getRegion());
-                            } catch (Exception e) {
-                                LOG.warnv("ESM {0}: failed to delete filtered-out message {1}: {2}",
-                                        esm.getUuid(), m.getMessageId(), e.getMessage());
-                            }
-                        }
-                    }
-                    if (matched.isEmpty()) {
-                        return;
-                    }
-                }
-
-                String eventJson = buildSqsEvent(matched, esm);
-                LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
-                InvokeResult result;
-                try {
-                    result = executorService.invoke(
-                            fn, eventJson.getBytes(), InvocationType.RequestResponse);
-                } catch (AwsException e) {
-                    if ("TooManyRequestsException".equals(e.getErrorCode())) {
-                        LOG.infov("ESM {0}: function {1} throttled, messages will return to queue after visibility timeout",
-                                esm.getUuid(), fn.getFunctionName());
-                        return;
-                    }
-                    throw e;
-                }
-
-                if (result.getFunctionError() == null) {
-                    // Only the delivered (matched) messages are subject to delete/return here; filtered-out
-                    // messages were already deleted above, so a batchItemFailure id that names one is inert.
-                    Set<String> failedIds = extractBatchItemFailures(esm, result, messages);
-                    List<Message> toDelete = failedIds.isEmpty()
-                            ? matched
-                            : matched.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
-                    LOG.infov("ESM {0}: Lambda succeeded, deleting {1} of {2} delivered message(s) ({3} reported as failed)",
-                            esm.getUuid(), toDelete.size(), matched.size(), failedIds.size());
-                    for (Message msg : toDelete) {
-                        try {
-                            sqsService.deleteMessage(esm.getQueueUrl(),
-                                    msg.getReceiptHandle(), esm.getRegion());
-                        } catch (Exception e) {
-                            LOG.warnv("Failed to delete message {0}: {1}",
-                                    msg.getMessageId(), e.getMessage());
-                        }
-                    }
-                    // Reported partial-batch failures are not deleted; return them to the
-                    // queue immediately so they can be retried/redriven rather than sitting
-                    // in-flight for the full execution-cover visibility window.
-                    if (!failedIds.isEmpty()) {
-                        List<Message> toReturn = matched.stream()
-                                .filter(m -> failedIds.contains(m.getMessageId())).toList();
-                        returnMessagesToQueue(esm, toReturn);
-                    }
-                } else {
-                    LOG.warnv("ESM {0}: Lambda returned error [{1}], returning {2} delivered message(s) to queue for retry/redrive",
-                            esm.getUuid(), result.getFunctionError(), matched.size());
-                    returnMessagesToQueue(esm, matched);
-                }
+                pollOnce(esm, drainBacklog);
             } catch (Exception e) {
                 LOG.warnv("ESM {0}: poll/invoke error: {1} ({2})",
                         esm.getUuid(), e.getMessage(), e.getClass().getSimpleName());
             } finally {
-                activePolls.remove(esm.getUuid());
+                inFlight.decrementAndGet();
             }
         });
+    }
+
+    private int effectiveMaxConcurrency(EventSourceMapping esm) {
+        Integer configured = esm.getMaximumConcurrency();
+        return configured != null ? Math.max(1, configured) : defaultMaxConcurrency;
+    }
+
+    private static boolean tryAcquirePollSlot(AtomicInteger inFlight, int max) {
+        while (true) {
+            int current = inFlight.get();
+            if (current >= max) {
+                return false;
+            }
+            if (inFlight.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Receives the next batch for one poll, applying the batching window. Returns an empty list when
+     * there is nothing to deliver yet. Serialised per ESM because the window buffer is shared.
+     */
+    private List<Message> receiveBatch(EventSourceMapping esm, int window, int visibilityTimeout) {
+        synchronized (receiveLocks.computeIfAbsent(esm.getUuid(), k -> new Object())) {
+            PendingBatch pending = pendingBatches.get(esm.getUuid());
+            int alreadyBuffered = pending != null ? pending.messages.size() : 0;
+            int wanted = Math.max(1, esm.getBatchSize() - alreadyBuffered);
+
+            List<Message> received = sqsService.receiveMessage(
+                    esm.getQueueUrl(), wanted, visibilityTimeout, 0, esm.getRegion());
+
+            List<Message> messages;
+            if (window <= 0) {
+                // No window, or one that was just turned off: deliver now, draining anything a
+                // previous positive window had buffered so those messages are not stranded
+                // until their visibility expires (and cannot be replayed if the window returns).
+                List<Message> batch = pending != null ? pending.messages : new ArrayList<>();
+                pendingBatches.remove(esm.getUuid());
+                batch.addAll(received);
+                if (batch.isEmpty()) {
+                    return List.of();
+                }
+                messages = batch;
+            } else {
+                if (pending == null) {
+                    pending = new PendingBatch();
+                    pendingBatches.put(esm.getUuid(), pending);
+                }
+                if (pending.messages.isEmpty() && !received.isEmpty()) {
+                    pending.windowStartedAtMs = clockMs.getAsLong();
+                }
+                pending.messages.addAll(received);
+                if (pending.messages.isEmpty()) {
+                    return List.of();
+                }
+                boolean batchFull = pending.messages.size() >= esm.getBatchSize();
+                boolean windowElapsed =
+                        clockMs.getAsLong() - pending.windowStartedAtMs >= window * 1000L;
+                if (!batchFull && !windowElapsed) {
+                    return List.of();
+                }
+                messages = new ArrayList<>(pending.messages);
+                pendingBatches.remove(esm.getUuid());
+            }
+            return messages;
+        }
+    }
+
+    private void pollOnce(EventSourceMapping esm, boolean drainBacklog) {
+        // Look up the function first so we can set an appropriate visibility
+        // timeout: fn.timeout + 30s keeps messages hidden while Lambda runs.
+        // Use account-scoped lookup since this runs outside request scope.
+        LambdaFunction fn = targetResolver.resolveMappingTarget(esm).orElse(null);
+        if (fn == null) {
+            LOG.warnv("ESM {0}: function {1} not found in region {2}, skipping",
+                    esm.getUuid(), esm.getFunctionName(), esm.getRegion());
+            return;
+        }
+
+        // MaximumBatchingWindowInSeconds holds an underfilled batch open: keep messages
+        // received across earlier polls invisible and only invoke once the batch fills or
+        // the window since the first buffered message expires.
+        int window = esm.getMaximumBatchingWindowInSeconds() == null
+                ? 0 : esm.getMaximumBatchingWindowInSeconds();
+        // A message can be buffered for the whole window and then processed for the full
+        // function timeout, so visibility has to cover both plus AWS's 30s margin, not the
+        // larger of the two. Otherwise a long invoke can outlive the visibility and another
+        // consumer receives the message, causing a duplicate delivery and a stale handle.
+        int visibilityTimeout = fn.getTimeout() + Math.max(window, 0) + 30;
+
+        List<Message> messages = receiveBatch(esm, window, visibilityTimeout);
+        if (messages.isEmpty()) {
+            return;
+        }
+        // A full batch means more may be waiting: start another poll now, if a slot is free, rather
+        // than leaving the backlog to wait for the next tick behind this batch's invocation.
+        if (drainBacklog && messages.size() >= esm.getBatchSize()) {
+            pollAndInvoke(esm, true);
+        }
+
+        LOG.infov("ESM {0}: received {1} message(s)", esm.getUuid(), messages.size());
+
+        // Apply FilterCriteria. AWS consumes (permanently deletes) filtered-out SQS messages, so
+        // non-matching messages are deleted immediately: leaving them would redeliver every
+        // visibility window forever and never reach the DLQ. A batch that matches nothing
+        // short-circuits without invoking.
+        List<Message> matched = messages;
+        JsonNode filterParams = EsmFilterCriteriaUtils.matcherSourceParameters(objectMapper, esm.getFilterCriteria());
+        if (filterParams != null) {
+            List<JsonNode> recordNodes = new ArrayList<>(messages.size());
+            for (Message m : messages) {
+                recordNodes.add(buildSqsRecordNode(m, esm));
+            }
+            matched = EsmFilterCriteriaUtils.selectMatched(
+                    messages, recordNodes, filterMatcher.applyFilterCriteria(recordNodes, filterParams));
+            Set<Message> keep = Collections.newSetFromMap(new IdentityHashMap<>());
+            keep.addAll(matched);
+            for (Message m : messages) {
+                if (!keep.contains(m)) {
+                    try {
+                        sqsService.deleteMessage(esm.getQueueUrl(), m.getReceiptHandle(), esm.getRegion());
+                    } catch (Exception e) {
+                        LOG.warnv("ESM {0}: failed to delete filtered-out message {1}: {2}",
+                                esm.getUuid(), m.getMessageId(), e.getMessage());
+                    }
+                }
+            }
+            if (matched.isEmpty()) {
+                return;
+            }
+        }
+
+        String eventJson = buildSqsEvent(matched, esm);
+        LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
+        InvokeResult result;
+        try {
+            result = executorService.invoke(
+                    fn, eventJson.getBytes(), InvocationType.RequestResponse);
+        } catch (AwsException e) {
+            if ("TooManyRequestsException".equals(e.getErrorCode())) {
+                LOG.infov("ESM {0}: function {1} throttled, messages will return to queue after visibility timeout",
+                        esm.getUuid(), fn.getFunctionName());
+                return;
+            }
+            throw e;
+        }
+
+        if (result.getFunctionError() == null) {
+            // Only the delivered (matched) messages are subject to delete/return here; filtered-out
+            // messages were already deleted above, so a batchItemFailure id that names one is inert.
+            Set<String> failedIds = extractBatchItemFailures(esm, result, messages);
+            List<Message> toDelete = failedIds.isEmpty()
+                    ? matched
+                    : matched.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
+            LOG.infov("ESM {0}: Lambda succeeded, deleting {1} of {2} delivered message(s) ({3} reported as failed)",
+                    esm.getUuid(), toDelete.size(), matched.size(), failedIds.size());
+            for (Message msg : toDelete) {
+                try {
+                    sqsService.deleteMessage(esm.getQueueUrl(),
+                            msg.getReceiptHandle(), esm.getRegion());
+                } catch (Exception e) {
+                    LOG.warnv("Failed to delete message {0}: {1}",
+                            msg.getMessageId(), e.getMessage());
+                }
+            }
+            // Reported partial-batch failures are not deleted; return them to the
+            // queue immediately so they can be retried/redriven rather than sitting
+            // in-flight for the full execution-cover visibility window.
+            if (!failedIds.isEmpty()) {
+                List<Message> toReturn = matched.stream()
+                        .filter(m -> failedIds.contains(m.getMessageId())).toList();
+                returnMessagesToQueue(esm, toReturn);
+            }
+        } else {
+            LOG.warnv("ESM {0}: Lambda returned error [{1}], returning {2} delivered message(s) to queue for retry/redrive",
+                    esm.getUuid(), result.getFunctionError(), matched.size());
+            returnMessagesToQueue(esm, matched);
+        }
     }
 
     /**
