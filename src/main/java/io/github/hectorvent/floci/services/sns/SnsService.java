@@ -1494,6 +1494,20 @@ public class SnsService implements Resettable, ResourceProvider {
         subscriptionStore.put(key, sub);
     }
 
+    /**
+     * Removes a subscription attribute so it reads as never set, which is what an update that drops
+     * a property from the template needs. {@code SetSubscriptionAttributes} cannot do that: it only
+     * stores a value.
+     */
+    public void clearSubscriptionAttribute(String subscriptionArn, String attributeName, String region) {
+        String key = subKey(region, subscriptionArn);
+        Subscription sub = subscriptionStore.get(key)
+                .orElseThrow(() -> new AwsException("NotFound", "Subscription does not exist.", 404));
+        if (sub.getAttributes().remove(attributeName) != null) {
+            subscriptionStore.put(key, sub);
+        }
+    }
+
     private static void requireFirehoseRoleArn(String roleArn) {
         if (roleArn == null || !IAM_ROLE_ARN.matcher(roleArn).matches()) {
             throw new AwsException("InvalidParameter",

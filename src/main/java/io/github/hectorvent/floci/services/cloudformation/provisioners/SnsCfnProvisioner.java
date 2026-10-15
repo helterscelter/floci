@@ -24,6 +24,9 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
     private static final int TOPIC_NAME_MAX_LENGTH = 256;
     private static final String FIFO_SUFFIX = ".fifo";
 
+    private static final List<String> UPDATABLE_SUBSCRIPTION_ATTRIBUTES = List.of(
+            "FilterPolicy", "FilterPolicyScope", "RawMessageDelivery", "RedrivePolicy", "DeliveryPolicy");
+
     private final SnsService snsService;
 
     public SnsCfnProvisioner(SnsService snsService) {
@@ -140,10 +143,40 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
         if (props.has("RedrivePolicy") && !props.path("RedrivePolicy").isNull()) {
             attributes.put("RedrivePolicy", ctx.engine().resolveJsonAttribute(props.path("RedrivePolicy")));
         }
+        if (props.has("DeliveryPolicy") && !props.path("DeliveryPolicy").isNull()) {
+            attributes.put("DeliveryPolicy", ctx.engine().resolveJsonAttribute(props.path("DeliveryPolicy")));
+        }
 
         Subscription sub = snsService.subscribe(topicArn, protocol, endpoint, ctx.region(), attributes);
+        // subscribe returns the existing subscription for the same protocol and endpoint and
+        // ignores the attributes it was given, so an update writes them itself. AWS documents these
+        // properties as "Update requires: No interruption".
+        if (ctx.isUpdate()) {
+            applySubscriptionAttributes(sub.getSubscriptionArn(), attributes, ctx);
+        }
         r.setPhysicalId(sub.getSubscriptionArn());
         r.getAttributes().put("Arn", sub.getSubscriptionArn());
+    }
+
+    /**
+     * Brings the kept subscription's updatable attributes to the template's. A property the
+     * previous template declared and this one dropped goes back to what a subscription created
+     * without it has; one the stack never declared is left as it is.
+     */
+    private void applySubscriptionAttributes(String subscriptionArn, Map<String, String> desired,
+                                             ProvisionContext ctx) {
+        desired.forEach((name, value) ->
+                snsService.setSubscriptionAttribute(subscriptionArn, name, value, ctx.region()));
+        for (String name : UPDATABLE_SUBSCRIPTION_ATTRIBUTES) {
+            if (desired.containsKey(name) || !ctx.previouslyDeclared(name)) {
+                continue;
+            }
+            if ("RawMessageDelivery".equals(name)) {
+                snsService.setSubscriptionAttribute(subscriptionArn, name, "false", ctx.region());
+            } else {
+                snsService.clearSubscriptionAttribute(subscriptionArn, name, ctx.region());
+            }
+        }
     }
 
     /**

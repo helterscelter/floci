@@ -356,6 +356,21 @@ class SnsServiceTest {
     }
 
     @Test
+    void clearSubscriptionAttribute_removesTheAttributeSoItReadsAsNeverSet() {
+        Topic topic = snsService.createTopic("clear-topic", null, null, REGION);
+        Subscription sub = snsService.subscribe(topic.getTopicArn(), "sqs",
+                "arn:aws:sqs:us-east-1:000000000000:clear-queue", REGION,
+                Map.of("FilterPolicy", "{\"a\":[\"b\"]}"));
+
+        snsService.clearSubscriptionAttribute(sub.getSubscriptionArn(), "FilterPolicy", REGION);
+
+        assertFalse(snsService.getSubscriptionAttributes(sub.getSubscriptionArn(), REGION)
+                .containsKey("FilterPolicy"));
+        assertThrows(AwsException.class,
+                () -> snsService.clearSubscriptionAttribute("nope", "FilterPolicy", REGION));
+    }
+
+    @Test
     void subscribe_idempotent() {
         Topic topic = snsService.createTopic("my-topic", null, null, REGION);
         Subscription sub1 = snsService.subscribe(topic.getTopicArn(), "sqs",
