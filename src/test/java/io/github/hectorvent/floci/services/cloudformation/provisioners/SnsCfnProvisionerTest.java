@@ -424,6 +424,96 @@ class SnsCfnProvisionerTest {
                 "unset optional attributes must not be sent as empty strings");
     }
 
+    private static final String SUB_ARN = TOPIC_ARN + ":11111111-2222-3333-4444-555555555555";
+
+    private ProvisionContext updateContext(String previousProperties) {
+        return new ProvisionContext(engine, REGION, "000000000000", "my-stack", SUB_ARN,
+                event -> {}, props(previousProperties));
+    }
+
+    private StackResource provisionUpdate(ProvisionContext updateCtx, String json) {
+        StackResource r = new StackResource();
+        r.setLogicalId("Sub");
+        r.setResourceType("AWS::SNS::Subscription");
+        r.setPhysicalId(SUB_ARN);
+        r.setAttributes(new HashMap<>());
+        provisioner.provision(r, props(json), updateCtx);
+        return r;
+    }
+
+    /**
+     * SnsService.subscribe returns the existing subscription when the protocol and endpoint match
+     * and ignores the attributes it was given, so an update that only changed a filter reached
+     * nothing. AWS::SNS::Subscription documents these properties as "Update requires: No
+     * interruption", so the update has to write them onto the subscription it kept.
+     */
+    @Test
+    void anUpdateWritesTheChangedAttributesOntoTheExistingSubscription() {
+        when(sns.subscribe(eq(TOPIC_ARN), eq("sqs"), eq("arn:queue"), eq(REGION), anyMap()))
+                .thenReturn(subscription(SUB_ARN));
+
+        StackResource r = provisionUpdate(updateContext("""
+                {"TopicArn": "%s", "Protocol": "sqs", "Endpoint": "arn:queue",
+                 "FilterPolicy": {"detail-type": ["a"]}, "FilterPolicyScope": "MessageBody",
+                 "RawMessageDelivery": true}
+                """.formatted(TOPIC_ARN)), """
+                {"TopicArn": "%s", "Protocol": "sqs", "Endpoint": "arn:queue",
+                 "FilterPolicy": {"detail-type": ["a", "b"]}, "FilterPolicyScope": "MessageAttributes",
+                 "RawMessageDelivery": false,
+                 "RedrivePolicy": {"deadLetterTargetArn": "arn:dlq"},
+                 "DeliveryPolicy": {"healthyRetryPolicy": {"numRetries": 5}}}
+                """.formatted(TOPIC_ARN));
+
+        assertEquals(SUB_ARN, r.getPhysicalId());
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "FilterPolicy",
+                "{\"detail-type\":[\"a\",\"b\"]}", REGION);
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "FilterPolicyScope", "MessageAttributes", REGION);
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "RawMessageDelivery", "false", REGION);
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "RedrivePolicy",
+                "{\"deadLetterTargetArn\":\"arn:dlq\"}", REGION);
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "DeliveryPolicy",
+                "{\"healthyRetryPolicy\":{\"numRetries\":5}}", REGION);
+    }
+
+    @Test
+    void aCreateStillPassesTheAttributesToSubscribeOnly() {
+        when(sns.subscribe(anyString(), anyString(), anyString(), anyString(), anyMap()))
+                .thenReturn(subscription(SUB_ARN));
+
+        provision("AWS::SNS::Subscription", """
+                {"TopicArn": "t", "Protocol": "sqs", "Endpoint": "e",
+                 "FilterPolicy": {"a": ["b"]}, "DeliveryPolicy": {"x": 1}}
+                """);
+
+        verify(sns, never()).setSubscriptionAttribute(anyString(), anyString(), anyString(), anyString());
+        verify(sns, never()).clearSubscriptionAttribute(anyString(), anyString(), anyString());
+    }
+
+    /**
+     * A property the new template dropped goes back to what a subscription made without it has:
+     * no filter, no redrive or delivery policy, the MessageAttributes scope and raw delivery off.
+     * A property the stack never declared is left alone, so an attribute set out of band stays.
+     */
+    @Test
+    void anUpdateResetsAttributesTheTemplateDropped() {
+        when(sns.subscribe(eq(TOPIC_ARN), eq("sqs"), eq("arn:queue"), eq(REGION), anyMap()))
+                .thenReturn(subscription(SUB_ARN));
+
+        provisionUpdate(updateContext("""
+                {"TopicArn": "%s", "Protocol": "sqs", "Endpoint": "arn:queue",
+                 "FilterPolicy": {"a": ["b"]}, "FilterPolicyScope": "MessageBody",
+                 "RawMessageDelivery": true, "RedrivePolicy": {"deadLetterTargetArn": "arn:dlq"}}
+                """.formatted(TOPIC_ARN)), """
+                {"TopicArn": "%s", "Protocol": "sqs", "Endpoint": "arn:queue"}
+                """.formatted(TOPIC_ARN));
+
+        verify(sns).clearSubscriptionAttribute(SUB_ARN, "FilterPolicy", REGION);
+        verify(sns).clearSubscriptionAttribute(SUB_ARN, "FilterPolicyScope", REGION);
+        verify(sns).clearSubscriptionAttribute(SUB_ARN, "RedrivePolicy", REGION);
+        verify(sns).setSubscriptionAttribute(SUB_ARN, "RawMessageDelivery", "false", REGION);
+        verify(sns, never()).clearSubscriptionAttribute(SUB_ARN, "DeliveryPolicy", REGION);
+    }
+
     @Test
     void topicPolicyWritesTheDocumentToEveryListedTopic() {
         StackResource r = provision("AWS::SNS::TopicPolicy", """
