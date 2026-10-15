@@ -106,6 +106,19 @@ class BuildV2ProxyEventMultiValueTest {
 
     @ParameterizedTest
     @EnumSource(Builder.class)
+    void cookieHeaderIsNotRepeatedInHeaders(Builder builder) throws Exception {
+        requestHeaders.add("Cookie", "a=1; b=2");
+        requestHeaders.add("X-Single", "only");
+
+        JsonNode event = buildEvent(builder);
+
+        assertEquals("[\"a=1\",\"b=2\"]", String.valueOf(event.get("cookies")));
+        assertFalse(event.get("headers").has("cookie"));
+        assertEquals("only", event.get("headers").get("x-single").asText());
+    }
+
+    @ParameterizedTest
+    @EnumSource(Builder.class)
     void everyCookieHeaderContributesToCookiesArray(Builder builder) throws Exception {
         requestHeaders.addAll("cookie", List.of("a=1; b=2", "c=3"));
 
