@@ -3679,8 +3679,9 @@ public class ApiGatewayExecuteController {
      * Writes {@code cookies}, {@code headers} and {@code queryStringParameters} the way payload
      * format 2.0 carries them, for both the Lambda integration event and the Lambda authorizer
      * event. Format 2.0 has no multi-value maps: AWS combines duplicate headers and duplicate
-     * query strings with commas, and lists the request's cookies in their own array, which is
-     * left out when the request has none.
+     * query strings with commas, and moves the request's cookies into their own array, which is
+     * left out when the request has none. The {@code cookie} header is not repeated in
+     * {@code headers}.
      */
     private static void putV2CookiesHeadersAndQuery(ObjectNode event,
                                                     MultivaluedMap<String, String> requestHeaders,
@@ -3693,6 +3694,9 @@ public class ApiGatewayExecuteController {
 
         ObjectNode headersNode = event.putObject("headers");
         for (Map.Entry<String, List<String>> e : requestHeaders.entrySet()) {
+            if (CookieHeaders.isCookieHeader(e.getKey())) {
+                continue;
+            }
             if (!e.getValue().isEmpty()) {
                 headersNode.put(e.getKey().toLowerCase(), String.join(",", e.getValue()));
             }

@@ -24,7 +24,7 @@ public final class CookieHeaders {
     public static List<String> cookiePairs(Map<String, List<String>> requestHeaders) {
         List<String> cookies = new ArrayList<>();
         for (Map.Entry<String, List<String>> e : requestHeaders.entrySet()) {
-            if (!HttpHeaders.COOKIE.equalsIgnoreCase(e.getKey())) {
+            if (!isCookieHeader(e.getKey())) {
                 continue;
             }
             for (String header : e.getValue()) {
@@ -37,5 +37,10 @@ public final class CookieHeaders {
             }
         }
         return cookies;
+    }
+
+    /** Whether {@code name} is the {@code Cookie} request header, matched case-insensitively. */
+    public static boolean isCookieHeader(String name) {
+        return HttpHeaders.COOKIE.equalsIgnoreCase(name);
     }
 }
