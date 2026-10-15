@@ -2908,6 +2908,20 @@ public interface EmulatorConfig {
         Optional<String> containerNamePrefix();
 
         /**
+         * When true, and the executor is {@code docker}, Floci removes on the first function launch
+         * every Lambda container a previous run of <em>this same</em> Floci left on the daemon
+         * (matched by the {@code io.floci.owner} label and this instance's container name prefix).
+         * A container whose Floci was removed or killed without a graceful stop can never be
+         * adopted: its runtime polls a Runtime API port that died with that process. Turn it off
+         * when two Floci instances share a daemon with the same port, no resource namespace and
+         * the same container name prefix, so one does not remove the other's containers.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP
+         */
+        @WithDefault("true")
+        boolean reconcileContainersOnStartup();
+
+        /**
          * Maximum concurrent first-time code-volume populates. Populating streams a large
          * function's unpacked code into a helper container, so a burst of them can overwhelm
          * the Docker daemon; this caps how many run at once.

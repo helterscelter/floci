@@ -148,6 +148,8 @@ floci:
     lambda:
       enabled: true
       docker-flags: ""
+      # Tests must not sweep whatever Lambda containers the CI daemon happens to hold.
+      reconcile-containers-on-startup: false
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1

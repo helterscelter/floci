@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.Frame;
@@ -38,6 +39,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -48,6 +50,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,6 +62,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -426,13 +430,67 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         ContainerSpec spec = captureRealContainerSpec();
+        Map<String, String> identity = new HashMap<>(spec.labels());
+        String run = identity.remove("io.floci.lambda.run");
         assertEquals(Map.of(
                 "io.floci", "aws",
                 "io.floci.service", "lambda",
                 "io.floci.resource-id", "standard-fn",
                 "io.floci.account", "222222222222",
-                "io.floci.region", "us-west-2"),
-                spec.labels());
+                "io.floci.region", "us-west-2",
+                "io.floci.owner", "4566"),
+                identity);
+        assertFalse(run == null || run.isBlank(), "the launching run must be labelled for the sweep");
+    }
+
+    @Test
+    void launchKeepsTheSweepIdentityWhenDockerFlagsSetTheSameLabels() {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.dockerFlags()).thenReturn(Optional.of(
+                "--label io.floci.owner=someone-else --label io.floci.lambda.run=forged"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("flags-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+
+        launcher.launch(fn);
+
+        Map<String, String> labels = captureRealContainerSpec().labels();
+        assertEquals("4566", labels.get("io.floci.owner"));
+        assertNotEquals("forged", labels.get("io.floci.lambda.run"));
+    }
+
+    private long containerListings() {
+        return mockingDetails(dockerClient).getInvocations().stream()
+                .filter(invocation -> "listContainersCmd".equals(invocation.getMethod().getName()))
+                .count();
+    }
+
+    @Test
+    void launchSweepsLeftoverContainersBeforeCreatingTheFirstOne() {
+        when(config.services().lambda().reconcileContainersOnStartup()).thenReturn(true);
+        ListContainersCmd list = mock(ListContainersCmd.class, Answers.RETURNS_SELF);
+        when(list.exec()).thenReturn(List.of());
+        when(dockerClient.listContainersCmd()).thenReturn(list);
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("sweep-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+
+        launcher.launch(fn);
+
+        // One listing per label spelling (current and legacy keys), all before the first create.
+        InOrder order = inOrder(dockerClient, lifecycleManager);
+        order.verify(dockerClient, atLeastOnce()).listContainersCmd();
+        order.verify(lifecycleManager).create(any(ContainerSpec.class));
+        long listingsForTheSweep = containerListings();
+
+        launcher.launch(fn);
+
+        assertEquals(listingsForTheSweep, containerListings(),
+                "a completed sweep must not run again on later launches");
     }
 
     @Test

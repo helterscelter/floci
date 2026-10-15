@@ -376,6 +376,9 @@ floci:
     lambda:
       enabled: true
       ephemeral: false
+      # Remove the Lambda containers a previous run of this Floci left on the Docker daemon, on the
+      # first launch. Scoped to this deployment's owner label and container name prefix.
+      reconcile-containers-on-startup: true   # FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP
       # Extra Docker create flags for Lambda containers, for example: --env KEY=VALUE --volume /host:/container:ro
       docker-flags: ""
       ecr-base-uri: public.ecr.aws            # FLOCI_SERVICES_LAMBDA_ECR_BASE_URI — registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)

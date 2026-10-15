@@ -495,6 +495,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes; with `FLOCI_DOCKER_RESOURCE_NAMESPACE` set, the namespace follows the prefix and a short hash of it ends the volume name, e.g. `acme-<namespace>-code-<function>-<hash>-<namespace hash>`). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
+| `FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | With the `docker` executor, remove on the first function launch the Lambda containers a previous run of this Floci left on the daemon (matched by the `io.floci.owner` label and this instance's container name prefix). A container is left behind when Floci is removed or killed while a function container is running; it can never be adopted. Containers of other Floci instances, containers without the owner label, and the current run's containers are never touched. Turn off only when two instances share a daemon with the same port, no resource namespace and the same prefix |
 | `FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY` | `max(2, cpus/2)` | Maximum concurrent first-time code-volume populates. See the note below |
 | `FLOCI_SERVICES_LAMBDA_EXECUTOR` | `docker` | Execution backend: `docker` (containers) or `kubernetes` (pods) |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_NAMESPACE` | `default` | Namespace Lambda pods are created in |
@@ -537,6 +538,20 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     The temporary copy helper is removed without a stop grace period once copying
     finishes or fails. It runs no Lambda code; actual execution environments retain
     their normal shutdown and extension-drain behavior.
+
+!!! note "Containers left by a previous run"
+    A Lambda container that is running when Floci is removed or killed without a graceful stop
+    (`docker rm -f`, a compose recreate, SIGKILL, OOM) is left on the daemon, and a new Floci
+    cannot adopt it: its runtime polls a Runtime API port that died with the old process. With
+    the `docker` executor, Floci removes such containers once, before the first function launch
+    of a run. Only a container this deployment owns is removed: it must carry the Lambda service
+    label, the `io.floci.owner` label of this instance (its API port, behind the resource
+    namespace) and a name under this instance's `container-name-prefix`. Containers of another
+    Floci sharing the daemon, containers without the owner label (including ones created before
+    it was stamped) and the current run's own containers are left alone. A sweep that cannot
+    list or remove a container is retried on the next launch. Set
+    `FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP=false` to turn it off. The Kubernetes
+    executor has its own pod sweep.
 
 !!! note "Bounding warm containers"
     After an invocation the container stays warm so the next call skips the cold start, and is

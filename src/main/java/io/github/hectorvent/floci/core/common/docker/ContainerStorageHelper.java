@@ -52,6 +52,8 @@ public final class ContainerStorageHelper {
     public static final String COMPONENT_LABEL = "io.floci.component";
     /** The Floci process run that created an ECS container. */
     public static final String ECS_RUN_LABEL = "io.floci.ecs.run";
+    /** The Floci process run that created a Lambda container. */
+    public static final String LAMBDA_RUN_LABEL = "io.floci.lambda.run";
     /** Marks the proxy holding the ECS container-credentials address on a network. */
     public static final String ECS_CREDENTIALS_PROXY_LABEL = "io.floci.ecs.credentials-proxy";
     /** Marks the helper that owns a protected workload's network namespace and firewall. */
@@ -187,6 +189,7 @@ public final class ContainerStorageHelper {
 
     private static Set<String> reservedLabelKeys() {
         Set<String> keys = new LinkedHashSet<>(List.of("floci", "floci_emulator", "floci_namespace"));
+        keys.add(LAMBDA_RUN_LABEL);
         keys.addAll(CONTAINER_LABEL_ALIASES.keys());
         keys.addAll(NETWORK_LABEL_ALIASES.keys());
         return Set.copyOf(keys);
