@@ -40,3 +40,11 @@ This is the fork owner's local defect list, kept off upstream PRs. Each entry na
   - `EmrHiveStepsDockerIntegrationTest` and `RdsTemplateDatabaseRestoreIntegrationTest`: timeouts.
   - `EksRegistryHostsDockerIntegrationTest`, as above.
 - Running the suite on a boat.dev VM needs two firewall rules first, `iptables -I INPUT -i docker0 -j ACCEPT` and `iptables -I INPUT -i br+ -j ACCEPT`. Without them the VM's ufw drops traffic from containers to the host, and 19 more tests fail. On that VM each shard takes 20 to 35 minutes.
+
+## `make aws-data-check` and `make aws-data-sync` cannot run in the sbx image
+
+- Found: 2026-11-04
+- Symptom: under sbx both targets would fail to import `botocore`.
+- Cause: `tools/aws/regen_partitions.py:70-83` imports botocore from the system `python3`, or reads `local/aws/botocore`, which is gitignored (`.gitignore:26`) and absent from a fresh worktree. The targets need exactly `botocore==1.43.98` (`tools/aws/requirements.txt:1`), the release CI installs (`.github/workflows/partition-literals.yml:90-91`). The sbx image (`.git/sbx/Dockerfile`, entry `jvm`) installs no botocore: no distribution package at 1.43.98 is established, and the image's pinned-pip venv is off `PATH`, so the system `python3` cannot import from it.
+- Decision: the owner decided on 2026-11-04 that these two targets run on boat.dev, not under sbx, so the image gets no botocore. The alternative was a venv in the image plus `--botocore-data`.
+- Status: also recorded on the image's `Unresolved:` line in `.git/sbx/Dockerfile`, which is not committed.
